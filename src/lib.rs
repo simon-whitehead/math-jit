@@ -1,10 +1,8 @@
-extern crate byteorder;
 extern crate memmap;
 
 use std::{mem, ptr};
 use std::ops::{Deref, DerefMut};
 
-use byteorder::{ByteOrder, LittleEndian};
 use memmap::{Mmap, Protection};
 
 pub struct ExecutableMemory {
@@ -30,6 +28,12 @@ impl ExecutableMemory {
         }
     }
 
+    fn write_code_at(&mut self, code: &[u8], position: usize) {
+        for (src, dst) in code.iter().zip(self.code[position..].iter_mut()) {
+            *dst = *src;
+        }
+    }
+
     pub fn write_u64(&mut self, num: u64) {
         let b1 = (num & 0xFF) as u8;
         let b2 = ((num & 0xFF00) >> 0x08) as u8;
@@ -43,12 +47,21 @@ impl ExecutableMemory {
         self.write_code(&[b1, b2, b3, b4, b5, b6, b7, b8]);
     }
 
-    pub fn compile(&mut self) {
-        self.memory_map = Some(Mmap::anonymous(self.code.len(), Protection::ReadWrite).unwrap());
+    pub fn write_u64_at(&mut self, num: u64, position: usize) {
+        let b1 = (num & 0xFF) as u8;
+        let b2 = ((num & 0xFF00) >> 0x08) as u8;
+        let b3 = ((num & 0xFF0000) >> 0x10) as u8;
+        let b4 = ((num & 0xFF000000) >> 0x18) as u8;
+        let b5 = ((num & 0xFF00000000) >> 0x20) as u8;
+        let b6 = ((num & 0xFF0000000000) >> 0x28) as u8;
+        let b7 = ((num & 0xFF000000000000) >> 0x30) as u8;
+        let b8 = ((num & 0xFF00000000000000) >> 0x38) as u8;
+
+        self.write_code_at(&[b1, b2, b3, b4, b5, b6, b7, b8], position);
     }
 
     pub fn execute<T>(&mut self) -> T {
-        let mut memory_map = self.memory_map.as_mut().unwrap();
+        let mut memory_map = Mmap::anonymous(self.code.len(), Protection::ReadWrite).unwrap();
 
         unsafe {
             ptr::copy(self.code.as_ptr(), memory_map.mut_ptr(), self.code.len());
@@ -73,48 +86,55 @@ impl DerefMut for ExecutableMemory {
 }
 
 pub struct JITCalculator {
-    memory: ExecutableMemory,
+    add_code: ExecutableMemory,
 }
 
 impl JITCalculator {
     pub fn new() -> JITCalculator {
-        JITCalculator { memory: ExecutableMemory::new() }
+        JITCalculator { add_code: ExecutableMemory::new() }
     }
 
     /// Clears the memory map
     fn clear_mem(&mut self) {
-        self.memory.clear_mem();
+        self.add_code.clear_mem();
     }
 
     // Generates a "Add two numbers together" function in memory
     // and uses the arguments passed in as the memory locations to
     // add them together
     pub fn add<T>(&mut self, left: &T, right: &T) -> T {
-        let left_addr: usize = usize::from_str_radix(&format!("{:p}", left)[2..], 16).unwrap();
-        let right_addr: usize = usize::from_str_radix(&format!("{:p}", right)[2..], 16).unwrap();
+        let left_addr = left as *const T as usize;
+        let right_addr = right as *const T as usize;
 
-        self.memory.write_code(&[0x48, 0xb8);        /* mov rax,imm64 */]
-        self.memory.write_u64(left_addr as u64);     /* imm64 == address of left variable */
+        if self.add_code.is_empty() {
+            self.add_code.write_code(&[0x48, 0xb8]);        /* mov rax,imm64 */
+            self.add_code.write_u64(left_addr as u64);     /* imm64 == address of left variable */
 
-        self.memory.write_code(&[0x48, 0xbb]);       /* mov rbx,imm64 */
-        self.memory.write_u64(right_addr as u64);    /* imm64 == address of right variable */
+            self.add_code.write_code(&[0x48, 0xbb]);       /* mov rbx,imm64 */
+            self.add_code.write_u64(right_addr as u64);    /* imm64 == address of right variable */
 
-        self.memory.write_code(&[0x48, 0x8b, 0x08]); /* mov rcx,[rax] */
-        self.memory.write_code(&[0x48, 0x8b, 0x13]); /* mov rdx,[rbx] */
+            self.add_code.write_code(&[0x48, 0x8b, 0x08]); /* mov rcx,[rax] */
+            self.add_code.write_code(&[0x48, 0x8b, 0x13]); /* mov rdx,[rbx] */
 
-        self.memory.write_code(&[0x48, 0x01, 0xd1]); /* add rcx,rdx */
-        self.memory.write_code(&[0x48, 0x89, 0xc8]); /* mov rax,rcx */
-        self.memory.write_code(&[0xc3]);             /* ret */
+            self.add_code.write_code(&[0x48, 0x01, 0xd1]); /* add rcx,rdx */
+            self.add_code.write_code(&[0x48, 0x89, 0xc8]); /* mov rax,rcx */
+            self.add_code.write_code(&[0xc3]);             /* ret */
 
-        self.memory.compile();
+            self.add_code.execute::<T>()
+        } else {
+            self.add_code.write_u64_at(left_addr as u64, 0x02);
+            self.add_code.write_u64_at(right_addr as u64, 0x0C);
 
-        self.memory.execute::<T>()
+            self.add_code.execute::<T>()
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::mem;
 
     #[test]
     fn it_works() {
@@ -128,8 +148,6 @@ mod tests {
             ]
         );
 
-        executable_memory.compile();
-
         let result = executable_memory.execute::<u32>();
 
         assert_eq!(16, result);
@@ -142,15 +160,8 @@ mod tests {
         let a = &mut 10;
         let b = &mut 22;
 
-        let result = calc.add(a, b);
+        let result = calc.add::<u64>(a, b);
 
         assert_eq!(32, result);
-
-        *a = 40;
-        *b = 33;
-
-        let result = calc.add(a, b);
-
-        assert_eq!(73, result);
     }
 }
