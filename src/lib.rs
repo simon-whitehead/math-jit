@@ -163,5 +163,12 @@ mod tests {
         let result = calc.add::<u64>(a, b);
 
         assert_eq!(32, result);
+
+        *a = 30;
+        *b = 43;
+
+        let result = calc.add::<u64>(a, b);
+
+        assert_eq!(73, result);
     }
 }
